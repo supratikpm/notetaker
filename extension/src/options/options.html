@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Notetaker Settings</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f0f0f;
+      color: #f0f0f0;
+      min-height: 100vh;
+      padding: 32px;
+    }
+
+    .container { max-width: 560px; margin: auto; }
+
+    h1 {
+      font-size: 22px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+
+    .subtitle { font-size: 13px; color: #777; margin-bottom: 32px; }
+
+    .card {
+      background: #161616;
+      border: 1px solid #222;
+      border-radius: 12px;
+      padding: 20px 24px;
+      margin-bottom: 16px;
+    }
+
+    .card-title {
+      font-size: 11px;
+      font-weight: 700;
+      color: #555;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      margin-bottom: 16px;
+    }
+
+    .field { margin-bottom: 14px; }
+
+    label {
+      display: block;
+      font-size: 12px;
+      color: #999;
+      margin-bottom: 5px;
+    }
+
+    input[type="text"],
+    input[type="email"],
+    input[type="password"],
+    select {
+      width: 100%;
+      padding: 9px 12px;
+      background: #0f0f0f;
+      border: 1px solid #2a2a2a;
+      border-radius: 8px;
+      color: #f0f0f0;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    input:focus, select:focus { border-color: #1d4ed8; }
+
+    .hint { font-size: 11px; color: #555; margin-top: 4px; }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 9px 16px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+
+    .btn:hover { opacity: 0.85; }
+
+    .btn-primary { background: #1d4ed8; color: #fff; }
+    .btn-secondary { background: #222; color: #ccc; border: 1px solid #333; }
+    .btn-success { background: #15803d; color: #fff; }
+    .btn-danger { background: #991b1b; color: #fff; }
+
+    .auth-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .auth-status {
+      font-size: 12px;
+      color: #555;
+    }
+
+    .auth-status.ok { color: #22c55e; }
+
+    #save-btn {
+      width: 100%;
+      padding: 11px;
+      margin-top: 8px;
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: #15803d;
+      color: #fff;
+      padding: 10px 18px;
+      border-radius: 8px;
+      font-size: 13px;
+      opacity: 0;
+      transition: opacity 0.3s;
+      pointer-events: none;
+    }
+
+    .toast.show { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🎙 Notetaker Settings</h1>
+    <p class="subtitle">Configure your AI meeting notetaker</p>
+
+    <!-- Backend -->
+    <div class="card">
+      <div class="card-title">Backend Connection</div>
+      <div class="field">
+        <label>Backend URL</label>
+        <input type="text" id="backend-url" placeholder="http://localhost:8000" />
+        <div class="hint">Local Python backend. Run: <code>cd backend && uvicorn main:app</code></div>
+      </div>
+      <div class="field">
+        <label>Connection Status</label>
+        <span id="backend-status" style="font-size:13px;color:#555;">—</span>
+        <button class="btn btn-secondary" id="btn-test" style="margin-left:10px;padding:5px 12px;font-size:12px;">Test</button>
+      </div>
+    </div>
+
+    <!-- Email -->
+    <div class="card">
+      <div class="card-title">Email Settings</div>
+      <div class="field">
+        <label>Host Email (where SOP is sent)</label>
+        <input type="email" id="host-email" placeholder="you@gmail.com" />
+      </div>
+      <div class="field">
+        <label>Gmail Authentication</label>
+        <div class="auth-row">
+          <button class="btn btn-secondary" id="btn-gmail-auth">Connect Gmail</button>
+          <span class="auth-status" id="gmail-status">Not connected</span>
+        </div>
+        <div class="hint">Required to send meeting notes from your Gmail account.</div>
+      </div>
+    </div>
+
+    <!-- NVIDIA NIM -->
+    <div class="card">
+      <div class="card-title">NVIDIA NIM — SOP Generation</div>
+      <div class="field">
+        <label>NVIDIA NIM API Key</label>
+        <input type="password" id="nim-api-key" placeholder="nvapi-…" />
+        <div class="hint">Get your key at <strong>build.nvidia.com</strong> → API Keys</div>
+      </div>
+      <div class="field">
+        <label>Model</label>
+        <select id="nim-model">
+          <option value="nvidia/llama-3.1-nemotron-70b-instruct">Llama 3.1 Nemotron 70B (Recommended)</option>
+          <option value="meta/llama-3.1-405b-instruct">Meta Llama 3.1 405B</option>
+          <option value="mistralai/mistral-nemo">Mistral NeMo</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Transcription -->
+    <div class="card">
+      <div class="card-title">Transcription</div>
+      <div class="field">
+        <label>Whisper Model Size</label>
+        <select id="whisper-model">
+          <option value="base">Base (fast, ~1GB RAM)</option>
+          <option value="small">Small (better, ~2GB RAM)</option>
+          <option value="medium">Medium (good, ~5GB RAM)</option>
+          <option value="large-v3">Large v3 (best, ~10GB RAM)</option>
+        </select>
+        <div class="hint">Larger = better accuracy, slower. Restart backend after changing.</div>
+      </div>
+      <div class="field">
+        <label>HuggingFace Token (for speaker diarization)</label>
+        <input type="password" id="hf-token" placeholder="hf_…" />
+        <div class="hint">Accept pyannote license at <strong>hf.co/pyannote/speaker-diarization-3.1</strong></div>
+      </div>
+    </div>
+
+    <button class="btn btn-primary" id="save-btn">Save Settings</button>
+  </div>
+
+  <div class="toast" id="toast">Settings saved!</div>
+  <script src="options.js"></script>
+</body>
+</html>

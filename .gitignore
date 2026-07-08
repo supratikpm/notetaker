@@ -1,0 +1,28 @@
+# Secrets — never commit these
+backend/.env
+backend/credentials.json
+backend/token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+*.egg
+
+# Node / Extension
+extension/node_modules/
+extension/dist/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

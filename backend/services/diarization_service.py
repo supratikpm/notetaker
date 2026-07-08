@@ -1,0 +1,100 @@
+import asyncio
+import os
+import tempfile
+import logging
+import threading
+from typing import List
+from models import TranscriptSegment
+from config import HUGGINGFACE_TOKEN
+
+logger = logging.getLogger(__name__)
+
+_pipeline = None
+_pipeline_lock = threading.Lock()
+
+
+def _get_pipeline():
+    global _pipeline
+    if _pipeline is None:
+        with _pipeline_lock:
+            if _pipeline is None:
+                from pyannote.audio import Pipeline
+                logger.info("Loading pyannote diarization pipeline...")
+                _pipeline = Pipeline.from_pretrained(
+                    "pyannote/speaker-diarization-3.1",
+                    use_auth_token=HUGGINGFACE_TOKEN,
+                )
+                logger.info("Diarization pipeline loaded.")
+    return _pipeline
+
+
+def unload_pipeline() -> None:
+    global _pipeline
+    with _pipeline_lock:
+        _pipeline = None
+
+
+def _diarize_sync(audio_path: str) -> List[dict]:
+    """Synchronous diarization — must be run in a thread pool, not the event loop."""
+    pipeline = _get_pipeline()
+    diarization = pipeline(audio_path)
+    result = []
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        result.append({"speaker": speaker, "start": turn.start, "end": turn.end})
+    return result
+
+
+def merge_transcript_with_diarization(
+    whisper_segments: List[TranscriptSegment],
+    diarization: List[dict],
+) -> List[TranscriptSegment]:
+    def find_speaker(start: float, end: float) -> str:
+        best: str | None = None
+        best_overlap = 0.0
+        for d in diarization:
+            overlap = min(end, d["end"]) - max(start, d["start"])
+            if overlap > 0 and overlap > best_overlap:
+                best_overlap = overlap
+                best = d["speaker"]
+        return best or "Speaker"
+
+    return [
+        TranscriptSegment(
+            speaker=find_speaker(seg.start, seg.end),
+            text=seg.text,
+            start=seg.start,
+            end=seg.end,
+        )
+        for seg in whisper_segments
+    ]
+
+
+async def transcribe_and_diarize(audio_bytes: bytes, suffix: str = ".webm") -> tuple[List[TranscriptSegment], float]:
+    from services.whisper_service import transcribe_audio  # import here to avoid circular
+
+    suffix = suffix if suffix.startswith(".") else f".{suffix}"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+
+    try:
+        # Run CPU-bound Whisper in a thread pool to avoid blocking the event loop
+        whisper_segs, duration = await asyncio.to_thread(transcribe_audio, tmp_path)
+
+        if not HUGGINGFACE_TOKEN:
+            logger.warning("HUGGINGFACE_TOKEN not set — skipping speaker diarization (whisper-only).")
+            return whisper_segs, duration
+
+        try:
+            # Diarization is also CPU-bound — run in thread pool
+            diar = await asyncio.to_thread(_diarize_sync, tmp_path)
+            merged = merge_transcript_with_diarization(whisper_segs, diar)
+            return merged, duration
+        except Exception as e:
+            logger.warning("Diarization failed (%s) — returning Whisper-only transcript.", e)
+            return whisper_segs, duration
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass

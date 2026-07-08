@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Notetaker</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      width: 320px;
+      background: #0f0f0f;
+      color: #f0f0f0;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 16px 10px;
+      border-bottom: 1px solid #222;
+    }
+
+    .logo { font-size: 20px; }
+
+    .header-text h1 {
+      font-size: 14px;
+      font-weight: 700;
+      color: #fff;
+      letter-spacing: 0.3px;
+    }
+
+    .header-text p {
+      font-size: 11px;
+      color: #888;
+    }
+
+    .status-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 16px;
+      background: #161616;
+      border-bottom: 1px solid #222;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #555;
+      flex-shrink: 0;
+    }
+
+    .status-dot.recording { background: #ef4444; animation: pulse 1.5s infinite; }
+    .status-dot.processing { background: #f59e0b; animation: pulse 1s infinite; }
+    .status-dot.done { background: #22c55e; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    #status-text { font-size: 12px; color: #ccc; }
+
+    .section { padding: 12px 16px; border-bottom: 1px solid #1a1a1a; }
+
+    .section-title {
+      font-size: 10px;
+      font-weight: 600;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      margin-bottom: 8px;
+    }
+
+    .btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      width: 100%;
+      padding: 9px 14px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+
+    .btn:hover { opacity: 0.85; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-screenshot {
+      background: #1d4ed8;
+      color: #fff;
+    }
+
+    .btn-settings {
+      background: #1e1e1e;
+      color: #ccc;
+      border: 1px solid #333;
+      margin-top: 6px;
+    }
+
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .toggle-label { font-size: 13px; color: #ccc; }
+
+    .toggle {
+      position: relative;
+      width: 40px;
+      height: 22px;
+    }
+
+    .toggle input { opacity: 0; width: 0; height: 0; }
+
+    .slider {
+      position: absolute;
+      inset: 0;
+      background: #333;
+      border-radius: 22px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .slider::before {
+      content: "";
+      position: absolute;
+      width: 16px;
+      height: 16px;
+      left: 3px;
+      bottom: 3px;
+      background: #fff;
+      border-radius: 50%;
+      transition: transform 0.2s;
+    }
+
+    input:checked + .slider { background: #1d4ed8; }
+    input:checked + .slider::before { transform: translateX(18px); }
+
+    #screenshots-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+      margin-top: 8px;
+      min-height: 60px;
+    }
+
+    #screenshots-grid img {
+      width: 100%;
+      aspect-ratio: 16/9;
+      object-fit: cover;
+      border-radius: 4px;
+      border: 1px solid #2a2a2a;
+    }
+
+    #screenshots-empty {
+      font-size: 11px;
+      color: #555;
+      text-align: center;
+      padding: 18px 0;
+      grid-column: 1 / -1;
+    }
+
+    .footer {
+      padding: 8px 16px 12px;
+      display: flex;
+      gap: 6px;
+    }
+
+    #meeting-time {
+      font-size: 11px;
+      color: #555;
+      padding: 0 16px 10px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span class="logo">🎙</span>
+    <div class="header-text">
+      <h1>Notetaker</h1>
+      <p>AI Meeting Notes</p>
+    </div>
+  </div>
+
+  <div class="status-bar">
+    <div class="status-dot" id="status-dot"></div>
+    <span id="status-text">Not in a meeting</span>
+  </div>
+
+  <div id="meeting-time"></div>
+
+  <div class="section">
+    <div class="section-title">Controls</div>
+    <button class="btn btn-screenshot" id="btn-screenshot" disabled>
+      📷 Take Screenshot
+    </button>
+    <button class="btn" id="btn-process" style="background:#7c3aed;color:#fff;margin-top:6px;display:none">
+      ⚡ Process Meeting Now
+    </button>
+  </div>
+
+  <div class="section">
+    <div class="toggle-row">
+      <span class="toggle-label">Auto-join & record</span>
+      <label class="toggle">
+        <input type="checkbox" id="toggle-auto" checked />
+        <span class="slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Screenshots this meeting</div>
+    <div id="screenshots-grid">
+      <span id="screenshots-empty">No screenshots yet</span>
+    </div>
+  </div>
+
+  <div class="footer">
+    <button class="btn btn-settings" id="btn-settings" style="flex:1">⚙ Settings</button>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

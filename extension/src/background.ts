@@ -76,6 +76,39 @@ async function beginRecordingForTab(tabId: number): Promise<void> {
   });
 }
 
+// Recording is never auto-started (Chrome requires a user gesture for tab
+// capture). On join we only arm the session and prompt the user to click the
+// Notetaker icon → Start Recording.
+function promptToRecord(tabId: number): void {
+  try { chrome.action.setBadgeBackgroundColor({ color: "#f59e0b" }); } catch (_) {}
+  try { chrome.action.setBadgeText({ tabId, text: "▶" }); } catch (_) {}
+  chrome.notifications.create(`prompt_${tabId}`, {
+    type: "basic", iconUrl: "icons/icon48.png",
+    title: "Notetaker — ready to record",
+    message: "Click the Notetaker icon, then Start Recording.",
+  });
+}
+
+// End a meeting: process + finalize only if it was actually recording;
+// otherwise just clean up quietly (no "no transcript" noise).
+async function endMeetingForTab(tabId: number): Promise<void> {
+  if (!activeSessions.has(tabId)) {
+    const stored = await chrome.storage.session.get([`session_${tabId}`]);
+    const s = stored[`session_${tabId}`] as MeetingSession | undefined;
+    if (s?.sessionId) activeSessions.set(tabId, s);
+  }
+  const session = activeSessions.get(tabId);
+  if (!session) return;
+
+  if (session.recordingActive) {
+    await onMeetingEnded(tabId);
+  } else {
+    activeSessions.delete(tabId);
+    await chrome.storage.session.remove([`session_${tabId}`, `pending_${tabId}`]);
+    try { chrome.action.setBadgeText({ tabId, text: "" }); } catch (_) {}
+  }
+}
+
 function getMediaStreamIdOnce(tabId: number): Promise<string> {
   return new Promise<string>((resolve, reject) => {
     chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
@@ -133,6 +166,12 @@ async function startTabCapture(tabId: number): Promise<void> {
   } as ExtMessage);
 
   session.recordingActive = true;
+  // Persist the recording flag so a leave/close after a service-worker restart
+  // can tell a recorded meeting from one where the user never hit Record.
+  chrome.storage.session.get([`session_${tabId}`]).then((st) => {
+    const sd = (st[`session_${tabId}`] as Record<string, unknown>) ?? {};
+    chrome.storage.session.set({ [`session_${tabId}`]: { ...sd, recordingActive: true } });
+  });
   try { chrome.action.setBadgeBackgroundColor({ color: "#ef4444" }); } catch (_) {}
   try { chrome.action.setBadgeText({ tabId, text: "●" }); } catch (_) {}
   console.log("[Notetaker] START_RECORDING sent for tab", tabId, "session", session.sessionId);
@@ -384,12 +423,12 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (isMeetUrl(url)) {
     await onMeetingStarted(tabId, url);
   } else if (activeSessions.has(tabId)) {
-    await onMeetingEnded(tabId);
+    await endMeetingForTab(tabId);
   }
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
-  if (activeSessions.has(tabId)) await onMeetingEnded(tabId);
+  if (activeSessions.has(tabId)) await endMeetingForTab(tabId);
 });
 
 // ── Message handler ────────────────────────────────────────────────────────
@@ -432,21 +471,20 @@ chrome.runtime.onMessage.addListener((msg: ExtMessage, _sender, sendResponse) =>
   }
 
   if (msg.type === "MEETING_JOINED") {
-    // Content script detected the user is actually in the call — start recording.
+    // Content script detected the user is actually in the call. We do NOT
+    // auto-start recording (Chrome requires a user gesture for tab capture) —
+    // just arm the session and prompt the user to click Start Recording.
     const senderTab = _sender.tab;
     const senderTabId = senderTab?.id;
     if (senderTabId != null) {
       (async () => {
-        // The MV3 service worker may have been terminated during the lobby wait,
-        // wiping the in-memory activeSessions map. If so, recreate the session
-        // now — otherwise recording would silently never start.
         if (!activeSessions.has(senderTabId)) {
-          console.log("[Notetaker] Join with no active session — recreating (service worker restarted).");
           await onMeetingStarted(senderTabId, senderTab?.url ?? "");
         }
-        if (activeSessions.has(senderTabId)) {
-          console.log("[Notetaker] Join signal from tab", senderTabId, "— starting recording.");
-          await beginRecordingForTab(senderTabId);
+        const session = activeSessions.get(senderTabId);
+        if (session && !session.recordingActive) {
+          console.log("[Notetaker] Join signal from tab", senderTabId, "— prompting to record.");
+          promptToRecord(senderTabId);
         }
       })().catch((e) => console.warn("[Notetaker] join handling failed:", e));
     }
@@ -474,24 +512,13 @@ chrome.runtime.onMessage.addListener((msg: ExtMessage, _sender, sendResponse) =>
   }
 
   if (msg.type === "MEETING_LEFT" || msg.type === "MEETING_ENDED_EARLY") {
-    // Content script detected the user left the call — stop and process.
+    // Content script detected the user left the call. Finalize only if the user
+    // had actually started recording; otherwise clean up quietly.
     const senderTabId = _sender.tab?.id;
     if (senderTabId != null) {
       (async () => {
-        // If the service worker restarted mid-call, restore the session from
-        // storage so the recording still gets stopped + finalized.
-        if (!activeSessions.has(senderTabId)) {
-          const stored = await chrome.storage.session.get([`session_${senderTabId}`]);
-          const s = stored[`session_${senderTabId}`] as MeetingSession | undefined;
-          if (s?.sessionId) {
-            activeSessions.set(senderTabId, s);
-            console.log("[Notetaker] Restored session from storage for leave (service worker restarted).");
-          }
-        }
-        if (activeSessions.has(senderTabId)) {
-          console.log("[Notetaker] Leave signal from tab", senderTabId, "— ending meeting.");
-          await onMeetingEnded(senderTabId);
-        }
+        console.log("[Notetaker] Leave signal from tab", senderTabId, "— ending meeting.");
+        await endMeetingForTab(senderTabId);
       })().catch((e) => console.warn("[Notetaker] leave handling failed:", e));
     }
     sendResponse({ ok: true });

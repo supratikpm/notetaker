@@ -93,6 +93,22 @@ Backend runs at http://localhost:8000
 5. Use **📷 Take Screenshot** to capture key moments
 6. Leave the meeting — notes are generated and emailed automatically
 
+### Where things are saved
+
+Each meeting produces:
+
+| Output | Location |
+|--------|----------|
+| Transcript + generated notes (SOP) | `backend\meetings\<timestamp>_<title>.json` |
+| Audio recording | `backend\meetings\recordings\<timestamp>_<title>_audio.webm` |
+| Video recording (tab + audio) | `backend\meetings\recordings\<timestamp>_<title>_video.webm` |
+| Emailed notes | The **Host Email** set in Settings |
+
+The `.json` file references its recordings via the `recording_audio` / `recording_video`
+fields. Recordings can also be fetched at
+`http://localhost:8000/api/transcribe/recordings/<filename>`. Video is best-effort — if
+tab video capture isn't available, only the audio recording is saved.
+
 ---
 
 ## Architecture

@@ -108,9 +108,49 @@ def test_streaming_lifecycle(client):
     body = r.json()
     assert len(body["segments"]) == 2
     assert body["duration"] == 5.0
-    
-    # Verify the temporary stream file was deleted
+
+    # Transcription no longer deletes the recording — it is persisted via finalize.
+    assert file_path.exists()
+
+    # 4. Finalize moves the recording out of temp into meetings/recordings/.
+    r = client.post(f"/api/transcribe/recording/finalize?session_id={session_id}&basename=My Meeting")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert "audio" in body["files"]
+    audio_name = body["files"]["audio"]
+    assert audio_name.endswith("_audio.webm")
+
+    # Temp file gone; persisted file present and downloadable.
     assert not file_path.exists()
+    from routers.transcription import RECORDINGS_DIR
+    saved = RECORDINGS_DIR / audio_name
+    assert saved.exists()
+
+    dl = client.get(f"/api/transcribe/recordings/{audio_name}")
+    assert dl.status_code == 200
+
+    # Clean up the persisted test recording.
+    saved.unlink()
+
+
+def test_finalize_drops_empty_recording(client):
+    session_id = "test_empty_finalize"
+    client.post(f"/api/transcribe/stream/start?session_id={session_id}&kind=video")
+    from routers.transcription import get_stream_file_path
+    video_path = get_stream_file_path(session_id, "video")
+    assert video_path.exists()  # empty placeholder
+
+    r = client.post(f"/api/transcribe/recording/finalize?session_id={session_id}&basename=empty")
+    assert r.status_code == 200
+    # Empty (<100 byte) placeholder is dropped, not persisted.
+    assert "video" not in r.json()["files"]
+    assert not video_path.exists()
+
+
+def test_recording_download_rejects_traversal(client):
+    r = client.get("/api/transcribe/recordings/..%2f..%2fsecret.json")
+    assert r.status_code in (400, 404)
 
 
 def test_streaming_cleanup(client):

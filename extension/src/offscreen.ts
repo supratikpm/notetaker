@@ -1,19 +1,40 @@
 // Offscreen document — runs in a full DOM context (not service worker)
-// Handles tab audio capture + MediaRecorder (recallai pattern)
+// Handles tab capture + MediaRecorder (recallai pattern).
+//
+// Two parallel recordings are produced per meeting:
+//   • audio  — tab audio mixed with the mic at 16 kHz. Authoritative: this is
+//              what gets transcribed, and an upload failure fails the meeting.
+//   • video  — the tab's video track plus audio, for later viewing. Best-effort:
+//              if video capture or upload fails, the meeting still completes.
+// Both are streamed in chunks to the backend, keyed by (session_id, kind).
 
 import type { ExtMessage } from "./utils/messaging";
 
 const CHUNK_INTERVAL_MS = 5000;
 const MAX_UPLOAD_RETRIES = 3;
 
-let mediaRecorder: MediaRecorder | null = null;
+type StreamKind = "audio" | "video";
+
+interface PipelineState {
+  index: number;
+  queue: Promise<void>;
+}
+
+let audioRecorder: MediaRecorder | null = null;
+let videoRecorder: MediaRecorder | null = null;
 let currentTabId: number | null = null;
 let isRecording = false;
 let sessionId: string | null = null;
 let backendUrl = "http://localhost:8000";
-let chunkIndex = 0;
-let uploadQueue: Promise<void> = Promise.resolve();
-let hasUploadError = false;
+let audioMime = "audio/webm";
+
+// Per-kind upload bookkeeping.
+const pipelines: Record<StreamKind, PipelineState> = {
+  audio: { index: 0, queue: Promise.resolve() },
+  video: { index: 0, queue: Promise.resolve() },
+};
+let hasAudioError = false; // fatal — fails the meeting
+let videoDisabled = false; // best-effort — just stops video uploads
 
 chrome.runtime.onMessage.addListener((msg: ExtMessage, _sender, sendResponse) => {
   switch (msg.type) {
@@ -33,8 +54,8 @@ chrome.runtime.onMessage.addListener((msg: ExtMessage, _sender, sendResponse) =>
 
     case "STOP_RECORDING":
       // Always send RECORDING_COMPLETE — even if recording never started
-      if (mediaRecorder && mediaRecorder.state !== "inactive") {
-        stopRecording(); // onstop fires → waits for queue → RECORDING_COMPLETE
+      if (audioRecorder && audioRecorder.state !== "inactive") {
+        stopRecording(); // audio onstop fires → waits for queues → RECORDING_COMPLETE
       } else {
         // No active recorder (e.g. getUserMedia failed) — signal immediately
         chrome.runtime.sendMessage({
@@ -47,15 +68,42 @@ chrome.runtime.onMessage.addListener((msg: ExtMessage, _sender, sendResponse) =>
   }
 });
 
-function getSupportedMimeType(): string {
-  const candidates = [
-    "audio/webm;codecs=opus",
-    "audio/webm",
-    "audio/ogg;codecs=opus",
-    "audio/ogg",
-    "audio/mp4",
-  ];
+function pickMimeType(candidates: string[]): string {
   return candidates.find((m) => MediaRecorder.isTypeSupported(m)) ?? "";
+}
+
+// Acquire the tab capture stream. `withVideo` requests the tab's video track too;
+// falls back to the older "mandatory" constraint format for Chrome compat.
+async function getTabStream(streamId: string, withVideo: boolean): Promise<MediaStream> {
+  const videoConstraint = withVideo
+    ? ({ chromeMediaSource: "tab", chromeMediaSourceId: streamId } as unknown as MediaTrackConstraints)
+    : false;
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: {
+        // @ts-ignore — Chrome-specific non-standard constraint
+        chromeMediaSource: "tab",
+        // @ts-ignore
+        chromeMediaSourceId: streamId,
+      } as MediaTrackConstraints,
+      video: videoConstraint,
+    });
+  } catch (_flatErr) {
+    return await navigator.mediaDevices.getUserMedia({
+      // @ts-ignore
+      audio: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: streamId } },
+      // @ts-ignore
+      video: withVideo ? { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: streamId } } : false,
+    });
+  }
+}
+
+async function initBackendStream(kind: StreamKind): Promise<void> {
+  const res = await fetch(
+    `${backendUrl}/api/transcribe/stream/start?session_id=${sessionId}&kind=${kind}`,
+    { method: "POST" }
+  );
+  if (!res.ok) throw new Error(`Failed to initialize ${kind} stream. Status: ${res.status}`);
 }
 
 async function startRecording({
@@ -77,75 +125,105 @@ async function startRecording({
   currentTabId = tabId;
   sessionId = incomingSessionId || `session_${tabId}_${Date.now()}`;
   backendUrl = incomingBackendUrl || "http://localhost:8000";
-  chunkIndex = 0;
-  uploadQueue = Promise.resolve();
-  hasUploadError = false;
+  pipelines.audio = { index: 0, queue: Promise.resolve() };
+  pipelines.video = { index: 0, queue: Promise.resolve() };
+  hasAudioError = false;
+  videoDisabled = false;
   isRecording = false;
 
-  // 1. Initialize the backend stream file
+  // 1. Initialize the backend AUDIO stream file (fatal if it fails).
   try {
-    const startRes = await fetch(`${backendUrl}/api/transcribe/stream/start?session_id=${sessionId}`, {
-      method: "POST",
-    });
-    if (!startRes.ok) {
-      throw new Error(`Failed to initialize stream. Status: ${startRes.status}`);
-    }
+    await initBackendStream("audio");
   } catch (e) {
-    console.error("[Notetaker offscreen] Failed to start backend stream:", e);
+    console.error("[Notetaker offscreen] Failed to start backend audio stream:", e);
     throw e; // Triggers "RECORDING_FAILED" in onMessage switch
   }
 
-  // 2. Tab audio stream — try flat format first, fall back to mandatory (Chrome version compat)
+  // 2. Capture the tab. Try with video; degrade to audio-only if unavailable.
   let tabStream: MediaStream;
+  let hasVideo = false;
   try {
-    tabStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        // @ts-ignore — Chrome-specific non-standard constraint
-        chromeMediaSource: "tab",
-        // @ts-ignore
-        chromeMediaSourceId: streamId,
-      } as MediaTrackConstraints,
-      video: false,
-    });
-  } catch (_flatErr) {
-    // Fallback: mandatory format (older Chrome)
-    tabStream = await navigator.mediaDevices.getUserMedia({
-      // @ts-ignore
-      audio: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: streamId } },
-      video: false,
-    });
+    tabStream = await getTabStream(streamId, true);
+    hasVideo = tabStream.getVideoTracks().length > 0;
+  } catch (_videoErr) {
+    console.warn("[Notetaker offscreen] Tab video capture unavailable, audio only:", _videoErr);
+    tabStream = await getTabStream(streamId, false);
   }
 
-  // Mix in microphone if available, otherwise use tab-only
-  let finalStream = tabStream;
+  // 3. Microphone (optional).
+  let micStream: MediaStream | null = null;
   try {
-    const micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    const ctx = new AudioContext({ sampleRate: 16000 }); // 16 kHz — Whisper's native rate
-    const dest = ctx.createMediaStreamDestination();
-    ctx.createMediaStreamSource(tabStream).connect(dest);
-    ctx.createMediaStreamSource(micStream).connect(dest);
-    finalStream = dest.stream;
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
   } catch (_) {
-    // Mic unavailable — tab audio only, which is fine
+    // Mic unavailable — tab audio only, which is fine.
   }
 
-  const mimeType = getSupportedMimeType();
-  const recorderOpts = mimeType ? { mimeType } : {};
+  // 4. Audio stream for transcription: tab audio + mic mixed at 16 kHz (Whisper's rate).
+  let audioStream: MediaStream = tabStream;
+  try {
+    const ctx = new AudioContext({ sampleRate: 16000 });
+    const dest = ctx.createMediaStreamDestination();
+    ctx.createMediaStreamSource(new MediaStream(tabStream.getAudioTracks())).connect(dest);
+    if (micStream) ctx.createMediaStreamSource(micStream).connect(dest);
+    audioStream = dest.stream;
+  } catch (_) {
+    // Fall back to the raw tab stream's audio.
+    audioStream = new MediaStream(tabStream.getAudioTracks());
+  }
 
-  mediaRecorder = new MediaRecorder(finalStream, recorderOpts);
-  
-  mediaRecorder.ondataavailable = (e) => {
-    if (e.data.size > 0 && isRecording && !hasUploadError) {
-      queueChunkUpload(e.data);
-    }
+  audioMime = pickMimeType(["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/ogg", "audio/mp4"]);
+  audioRecorder = new MediaRecorder(audioStream, audioMime ? { mimeType: audioMime } : {});
+  audioRecorder.ondataavailable = (e) => {
+    if (e.data.size > 0 && isRecording && !hasAudioError) queueChunkUpload("audio", e.data);
   };
-  
-  mediaRecorder.onstop = () => {
+  audioRecorder.onstop = onAudioStop;
+  audioRecorder.onerror = (e) => {
+    console.error("[Notetaker offscreen] Audio MediaRecorder error:", e);
     isRecording = false;
-    // Wait for all pending uploads in the queue to complete before notifying background
-    const finalUploadQueue = uploadQueue;
-    finalUploadQueue.then(() => {
-      if (hasUploadError) {
+    chrome.runtime.sendMessage({
+      type: "RECORDING_FAILED",
+      payload: { tabId: currentTabId, error: "MediaRecorder error" },
+    } as ExtMessage);
+  };
+
+  // 5. Video stream (best-effort): tab video + audio, for viewing later.
+  if (hasVideo) {
+    try {
+      await initBackendStream("video");
+      const videoTracks = [
+        ...tabStream.getVideoTracks(),
+        ...tabStream.getAudioTracks(),
+        ...(micStream ? micStream.getAudioTracks() : []),
+      ];
+      const videoStream = new MediaStream(videoTracks);
+      const videoMime = pickMimeType(["video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"]);
+      videoRecorder = new MediaRecorder(videoStream, videoMime ? { mimeType: videoMime } : {});
+      videoRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0 && isRecording && !videoDisabled) queueChunkUpload("video", e.data);
+      };
+      videoRecorder.onerror = (e) => {
+        console.warn("[Notetaker offscreen] Video MediaRecorder error (non-fatal):", e);
+        videoDisabled = true;
+      };
+      videoRecorder.start(CHUNK_INTERVAL_MS);
+    } catch (e) {
+      console.warn("[Notetaker offscreen] Video recording disabled (non-fatal):", e);
+      videoRecorder = null;
+      videoDisabled = true;
+    }
+  }
+
+  audioRecorder.start(CHUNK_INTERVAL_MS); // collect chunks at the configured interval
+  isRecording = true;
+}
+
+function onAudioStop(): void {
+  isRecording = false;
+  // Wait for BOTH upload queues to drain before notifying background so the
+  // backend has the full recording ready to finalize.
+  Promise.all([pipelines.audio.queue, pipelines.video.queue])
+    .then(() => {
+      if (hasAudioError) {
         chrome.runtime.sendMessage({
           type: "RECORDING_FAILED",
           payload: { tabId: currentTabId, error: "Upload queue failed" },
@@ -153,84 +231,80 @@ async function startRecording({
       } else {
         chrome.runtime.sendMessage({
           type: "RECORDING_COMPLETE",
-          payload: { tabId: currentTabId, sessionId, mimeType: mimeType || "audio/webm", audioData: null },
+          payload: { tabId: currentTabId, sessionId, mimeType: audioMime || "audio/webm", audioData: null },
         } as ExtMessage);
       }
-    }).catch((err) => {
-      console.error("[Notetaker offscreen] Error during final chunk uploads queue drain:", err);
+    })
+    .catch((err) => {
+      console.error("[Notetaker offscreen] Error draining upload queues:", err);
       chrome.runtime.sendMessage({
         type: "RECORDING_FAILED",
         payload: { tabId: currentTabId, error: String(err) },
       } as ExtMessage);
     });
-  };
-  
-  mediaRecorder.onerror = (e) => {
-    console.error("[Notetaker offscreen] MediaRecorder error:", e);
-    isRecording = false;
-    chrome.runtime.sendMessage({
-      type: "RECORDING_FAILED",
-      payload: { tabId: currentTabId, error: "MediaRecorder error" },
-    } as ExtMessage);
-  };
-  
-  mediaRecorder.start(CHUNK_INTERVAL_MS); // collect chunks at the configured interval
-  isRecording = true;
 }
 
 function stopRecording(): void {
-  if (mediaRecorder && mediaRecorder.state !== "inactive") {
-    mediaRecorder.stop();
+  // Stop video first so its final chunk is enqueued before audio's onstop drains the queues.
+  if (videoRecorder && videoRecorder.state !== "inactive") {
+    try {
+      videoRecorder.stop();
+    } catch (_) {}
+  }
+  if (audioRecorder && audioRecorder.state !== "inactive") {
+    audioRecorder.stop();
   }
 }
 
-async function uploadChunkWithRetry(chunk: Blob, index: number): Promise<void> {
-  const url = `${backendUrl}/api/transcribe/stream/chunk?session_id=${sessionId}&chunk_index=${index}`;
-  
+async function uploadChunkWithRetry(kind: StreamKind, chunk: Blob, index: number): Promise<void> {
+  const url = `${backendUrl}/api/transcribe/stream/chunk?session_id=${sessionId}&kind=${kind}&chunk_index=${index}`;
+
   for (let attempt = 1; attempt <= MAX_UPLOAD_RETRIES; attempt++) {
     try {
       const response = await fetch(url, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/octet-stream",
-        },
+        headers: { "Content-Type": "application/octet-stream" },
         body: chunk,
       });
-      if (response.ok) {
-        return;
-      }
+      if (response.ok) return;
       throw new Error(`Server returned HTTP ${response.status}`);
     } catch (e) {
-      console.warn(`[Notetaker offscreen] Chunk ${index} upload attempt ${attempt} failed:`, e);
-      if (attempt === MAX_UPLOAD_RETRIES) {
-        throw e;
-      }
-      // Wait with exponential backoff (e.g. 1000ms, 2000ms, 4000ms...)
+      console.warn(`[Notetaker offscreen] ${kind} chunk ${index} upload attempt ${attempt} failed:`, e);
+      if (attempt === MAX_UPLOAD_RETRIES) throw e;
+      // Exponential backoff (1000ms, 2000ms, 4000ms...).
       const delay = 1000 * Math.pow(2, attempt - 1);
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
 }
 
-function queueChunkUpload(chunk: Blob): void {
-  const currentIndex = chunkIndex++;
-  
-  uploadQueue = uploadQueue.then(async () => {
-    if (hasUploadError) return; // Skip remaining uploads if one failed
+function queueChunkUpload(kind: StreamKind, chunk: Blob): void {
+  const pipeline = pipelines[kind];
+  const currentIndex = pipeline.index++;
+
+  pipeline.queue = pipeline.queue.then(async () => {
+    if (kind === "audio" && hasAudioError) return;
+    if (kind === "video" && videoDisabled) return;
     try {
-      await uploadChunkWithRetry(chunk, currentIndex);
+      await uploadChunkWithRetry(kind, chunk, currentIndex);
     } catch (e) {
-      console.error(`[Notetaker offscreen] Failed to upload chunk ${currentIndex} after ${MAX_UPLOAD_RETRIES} attempts:`, e);
-      hasUploadError = true;
-      // Stop/pause recorder and notify background cleanly
-      if (mediaRecorder && mediaRecorder.state !== "inactive") {
-        try {
-          mediaRecorder.stop();
-        } catch (_) {}
+      console.error(`[Notetaker offscreen] Failed to upload ${kind} chunk ${currentIndex}:`, e);
+      if (kind === "video") {
+        // Best-effort — drop the rest of the video but keep the meeting going.
+        videoDisabled = true;
+        if (videoRecorder && videoRecorder.state !== "inactive") {
+          try {
+            videoRecorder.stop();
+          } catch (_) {}
+        }
+        return;
       }
+      // Audio failure is fatal.
+      hasAudioError = true;
+      stopRecording();
       chrome.runtime.sendMessage({
         type: "RECORDING_FAILED",
-        payload: { tabId: currentTabId, error: `Upload failed at chunk ${currentIndex}` },
+        payload: { tabId: currentTabId, error: `Upload failed at audio chunk ${currentIndex}` },
       } as ExtMessage);
     }
   });

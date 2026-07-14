@@ -224,6 +224,27 @@ async function processCompletedMeeting(
     }
   }
 
+  // Persist the recording (audio + video) out of temp storage. Runs regardless
+  // of whether captions or Whisper produced the transcript.
+  let recordingFiles: { audio?: string; video?: string } = {};
+  if (activeSessionId) {
+    try {
+      const res = await fetch(
+        `${backendUrl}/api/transcribe/recording/finalize?session_id=${encodeURIComponent(activeSessionId)}` +
+          `&basename=${encodeURIComponent(pending.session.meetingTitle || "meeting")}`,
+        { method: "POST", signal: AbortSignal.timeout(30_000) }
+      );
+      if (res.ok) {
+        const data = await res.json() as { files?: { audio?: string; video?: string } };
+        recordingFiles = data.files ?? {};
+      } else {
+        console.warn("[Notetaker] Recording finalize returned HTTP", res.status);
+      }
+    } catch (e) {
+      console.error("[Notetaker] Recording finalize failed:", e);
+    }
+  }
+
   if (segments.length === 0) {
     const reason = transcriptSource === "whisper"
       ? "Transcription service failed — check backend is running."
@@ -251,6 +272,8 @@ async function processCompletedMeeting(
         meeting_title: pending.session.meetingTitle,
         meeting_date: meetingDate,
         host_name: "",
+        recording_audio: recordingFiles.audio ?? null,
+        recording_video: recordingFiles.video ?? null,
       }),
       signal: AbortSignal.timeout(60_000),
     });

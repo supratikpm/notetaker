@@ -25,6 +25,8 @@ def save_session(
     screenshots: Optional[List[str]] = None,
     host_name: Optional[str] = None,
     meeting_id: Optional[str] = None,
+    recording_audio: Optional[str] = None,
+    recording_video: Optional[str] = None,
 ) -> Path:
     """Write meeting session to a timestamped JSON file. Returns the file path."""
     _ensure_dir()
@@ -44,6 +46,8 @@ def save_session(
         "transcript": [seg.model_dump() for seg in segments],
         "sop_markdown": sop_markdown,
         "screenshot_count": len(screenshots) if screenshots else 0,
+        "recording_audio": recording_audio,
+        "recording_video": recording_video,
     }
 
     with open(filepath, "w", encoding="utf-8") as f:
@@ -69,6 +73,8 @@ def list_sessions() -> List[dict]:
                 "saved_at": data.get("saved_at"),
                 "transcript_segments": len(data.get("transcript", [])),
                 "screenshot_count": data.get("screenshot_count", 0),
+                "recording_audio": data.get("recording_audio"),
+                "recording_video": data.get("recording_video"),
             })
         except Exception as e:
             logger.warning("Could not read session file %s: %s", p.name, e)

@@ -76,31 +76,55 @@ async function beginRecordingForTab(tabId: number): Promise<void> {
   });
 }
 
+function getMediaStreamIdOnce(tabId: number): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
+      const err = chrome.runtime.lastError;
+      if (err || !id) reject(new Error(err?.message ?? "Failed to get stream ID"));
+      else resolve(id);
+    });
+  });
+}
+
 async function startTabCapture(tabId: number): Promise<void> {
   const session = activeSessions.get(tabId);
   if (!session) return;
 
-  try {
-    const settings = await chrome.storage.sync.get(["backendUrl"]);
-    const backendUrl = (settings.backendUrl as string) || "http://localhost:8000";
+  const settings = await chrome.storage.sync.get(["backendUrl"]);
+  const backendUrl = (settings.backendUrl as string) || "http://localhost:8000";
 
-    const streamId = await new Promise<string>((resolve, reject) => {
-      chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
-        const err = chrome.runtime.lastError;
-        if (err || !id) reject(new Error(err?.message ?? "Failed to get stream ID"));
-        else resolve(id);
-      });
-    });
-
-    chrome.runtime.sendMessage({
-      type: "START_RECORDING",
-      payload: { streamId, tabId, sessionId: session.sessionId, backendUrl },
-    } as ExtMessage);
-
-    session.recordingActive = true;
-  } catch (e) {
-    console.warn("[Notetaker] Tab capture failed:", e);
+  // getMediaStreamId can transiently fail on a second capture in the same
+  // profile (the previous capture may not be fully torn down yet). Retry.
+  let streamId: string | null = null;
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      streamId = await getMediaStreamIdOnce(tabId);
+      break;
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[Notetaker] getMediaStreamId attempt ${attempt} failed:`, e);
+      await new Promise((r) => setTimeout(r, 400 * attempt));
+    }
   }
+
+  if (!streamId) {
+    console.error("[Notetaker] Tab capture failed after retries:", lastErr);
+    chrome.notifications.create(`capfail_${tabId}`, {
+      type: "basic", iconUrl: "icons/icon48.png",
+      title: "Notetaker — recording didn't start",
+      message: "Couldn't capture this tab. Click the Notetaker icon on the meeting tab, then rejoin.",
+    });
+    return;
+  }
+
+  chrome.runtime.sendMessage({
+    type: "START_RECORDING",
+    payload: { streamId, tabId, sessionId: session.sessionId, backendUrl },
+  } as ExtMessage);
+
+  session.recordingActive = true;
+  console.log("[Notetaker] START_RECORDING sent for tab", tabId, "session", session.sessionId);
 }
 
 async function onMeetingEnded(tabId: number): Promise<void> {

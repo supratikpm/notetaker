@@ -68,3 +68,62 @@ def test_transcribe_infers_suffix_from_content_type(client):
     # The suffix passed should be .ogg
     call_kwargs = mock_fn.call_args
     assert call_kwargs.kwargs.get("suffix") == ".ogg" or ".ogg" in str(call_kwargs)
+
+
+def test_streaming_lifecycle(client):
+    session_id = "test_session_123"
+    
+    # 1. Start streaming
+    r = client.post(f"/api/transcribe/stream/start?session_id={session_id}")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+    
+    # Verify file is touched/created
+    from routers.transcription import get_stream_file_path
+    file_path = get_stream_file_path(session_id)
+    assert file_path.exists()
+    assert file_path.stat().st_size == 0
+    
+    # 2. Upload chunks
+    chunk_1 = b"chunk-data-1-padding-padding-padding" * 3
+    r = client.post(f"/api/transcribe/stream/chunk?session_id={session_id}&chunk_index=0", content=chunk_1)
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+    
+    chunk_2 = b"chunk-data-2-padding-padding-padding" * 3
+    r = client.post(f"/api/transcribe/stream/chunk?session_id={session_id}&chunk_index=1", content=chunk_2)
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+    
+    assert file_path.stat().st_size == len(chunk_1) + len(chunk_2)
+    
+    # 3. Transcribe using session_id
+    with patch("routers.transcription.transcribe_and_diarize", new_callable=AsyncMock,
+               return_value=(FAKE_SEGMENTS, 5.0)) as mock_fn:
+        r = client.post(
+            "/api/transcribe",
+            data={"session_id": session_id}
+        )
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["segments"]) == 2
+    assert body["duration"] == 5.0
+    
+    # Verify the temporary stream file was deleted
+    assert not file_path.exists()
+
+
+def test_streaming_cleanup(client):
+    session_id = "test_cleanup_session"
+    
+    # Start and touch file
+    client.post(f"/api/transcribe/stream/start?session_id={session_id}")
+    from routers.transcription import get_stream_file_path
+    file_path = get_stream_file_path(session_id)
+    assert file_path.exists()
+    
+    # Call cleanup
+    r = client.post(f"/api/transcribe/stream/cleanup?session_id={session_id}")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+    assert not file_path.exists()

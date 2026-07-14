@@ -7,6 +7,7 @@ interface MeetingSession {
   meetingTitle: string;
   startTime: number;
   recordingActive: boolean;
+  sessionId?: string;
 }
 
 const activeSessions = new Map<number, MeetingSession>();
@@ -40,7 +41,8 @@ async function onMeetingStarted(tabId: number, url: string): Promise<void> {
 
     const meetingId = extractMeetingId(url);
     const meetingTitle = getMeetingTitle(url);
-    const session: MeetingSession = { tabId, meetingId, meetingTitle, startTime: Date.now(), recordingActive: false };
+    const sessionId = `session_${tabId}_${Date.now()}`;
+    const session: MeetingSession = { tabId, meetingId, meetingTitle, startTime: Date.now(), recordingActive: false, sessionId };
     activeSessions.set(tabId, session);
 
     await chrome.storage.session.set({ [`session_${tabId}`]: { ...session, screenshots: [] } });
@@ -69,6 +71,9 @@ async function startTabCapture(tabId: number): Promise<void> {
   if (!session) return;
 
   try {
+    const settings = await chrome.storage.sync.get(["backendUrl"]);
+    const backendUrl = (settings.backendUrl as string) || "http://localhost:8000";
+
     const streamId = await new Promise<string>((resolve, reject) => {
       chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
         const err = chrome.runtime.lastError;
@@ -79,7 +84,7 @@ async function startTabCapture(tabId: number): Promise<void> {
 
     chrome.runtime.sendMessage({
       type: "START_RECORDING",
-      payload: { streamId, tabId },
+      payload: { streamId, tabId, sessionId: session.sessionId, backendUrl },
     } as ExtMessage);
 
     session.recordingActive = true;
@@ -150,7 +155,12 @@ async function onMeetingEnded(tabId: number): Promise<void> {
   }
 }
 
-async function processCompletedMeeting(tabId: number, audioBlob: Blob | null, mimeType: string): Promise<void> {
+async function processCompletedMeeting(
+  tabId: number,
+  audioBlob: Blob | null,
+  mimeType: string,
+  sessionId?: string | null
+): Promise<void> {
   const stored = await chrome.storage.session.get([`pending_${tabId}`, `session_${tabId}`]);
   const pending = stored[`pending_${tabId}`];
   if (!pending) return; // Already processed
@@ -176,19 +186,33 @@ async function processCompletedMeeting(tabId: number, audioBlob: Blob | null, mi
   let segments = (pending.captionSegments as unknown[]) ?? [];
   let transcriptSource = "captions";
 
+  const activeSessionId = sessionId || pending.session?.sessionId;
+
   // Fall back to Whisper if no captions captured
-  if (segments.length === 0 && audioBlob) {
+  if (segments.length === 0 && (audioBlob || activeSessionId)) {
     transcriptSource = "whisper";
     try {
-      const filename = mimeType.includes("ogg") ? "recording.ogg"
-        : mimeType.includes("mp4") ? "recording.mp4"
-        : "recording.webm";
-      const formData = new FormData();
-      formData.append("audio", audioBlob, filename);
-      const res = await fetch(`${backendUrl}/api/transcribe`, {
-        method: "POST", body: formData,
-        signal: AbortSignal.timeout(120_000),
-      });
+      let res: Response;
+      if (activeSessionId) {
+        const formData = new FormData();
+        formData.append("session_id", activeSessionId);
+        res = await fetch(`${backendUrl}/api/transcribe`, {
+          method: "POST", body: formData,
+          signal: AbortSignal.timeout(120_000),
+        });
+      } else if (audioBlob) {
+        const filename = mimeType.includes("ogg") ? "recording.ogg"
+          : mimeType.includes("mp4") ? "recording.mp4"
+          : "recording.webm";
+        const formData = new FormData();
+        formData.append("audio", audioBlob, filename);
+        res = await fetch(`${backendUrl}/api/transcribe`, {
+          method: "POST", body: formData,
+          signal: AbortSignal.timeout(120_000),
+        });
+      } else {
+        throw new Error("No audio source available");
+      }
       if (res.ok) {
         const data = await res.json() as { segments: unknown[] };
         segments = data.segments ?? [];
@@ -300,10 +324,12 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 
 chrome.runtime.onMessage.addListener((msg: ExtMessage, _sender, sendResponse) => {
   if (msg.type === "RECORDING_COMPLETE") {
-    const { tabId, audioData, mimeType } = msg.payload as {
-      tabId: number; audioData: string | null; mimeType: string;
+    const { tabId, audioData, mimeType, sessionId } = msg.payload as {
+      tabId: number; audioData: string | null; mimeType: string; sessionId?: string | null;
     };
-    if (audioData) {
+    if (sessionId) {
+      processCompletedMeeting(tabId, null, mimeType || "audio/webm", sessionId);
+    } else if (audioData) {
       try {
         const binary = atob(audioData);
         const bytes = new Uint8Array(binary.length);

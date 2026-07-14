@@ -3,7 +3,7 @@ import os
 import tempfile
 import logging
 import threading
-from typing import List
+from typing import List, Optional
 from models import TranscriptSegment
 from config import HUGGINGFACE_TOKEN
 
@@ -69,17 +69,26 @@ def merge_transcript_with_diarization(
     ]
 
 
-async def transcribe_and_diarize(audio_bytes: bytes, suffix: str = ".webm") -> tuple[List[TranscriptSegment], float]:
+async def transcribe_and_diarize(
+    audio_bytes: Optional[bytes] = None,
+    file_path: Optional[str] = None,
+    suffix: str = ".webm",
+) -> tuple[List[TranscriptSegment], float]:
     from services.whisper_service import transcribe_audio  # import here to avoid circular
 
-    suffix = suffix if suffix.startswith(".") else f".{suffix}"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
+    temp_path = None
+    if file_path is None:
+        if audio_bytes is None:
+            raise ValueError("Either audio_bytes or file_path must be provided")
+        suffix = suffix if suffix.startswith(".") else f".{suffix}"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(audio_bytes)
+            temp_path = tmp.name
+            file_path = temp_path
 
     try:
         # Run CPU-bound Whisper in a thread pool to avoid blocking the event loop
-        whisper_segs, duration = await asyncio.to_thread(transcribe_audio, tmp_path)
+        whisper_segs, duration = await asyncio.to_thread(transcribe_audio, file_path)
 
         if not HUGGINGFACE_TOKEN:
             logger.warning("HUGGINGFACE_TOKEN not set — skipping speaker diarization (whisper-only).")
@@ -87,14 +96,15 @@ async def transcribe_and_diarize(audio_bytes: bytes, suffix: str = ".webm") -> t
 
         try:
             # Diarization is also CPU-bound — run in thread pool
-            diar = await asyncio.to_thread(_diarize_sync, tmp_path)
+            diar = await asyncio.to_thread(_diarize_sync, file_path)
             merged = merge_transcript_with_diarization(whisper_segs, diar)
             return merged, duration
         except Exception as e:
             logger.warning("Diarization failed (%s) — returning Whisper-only transcript.", e)
             return whisper_segs, duration
     finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass

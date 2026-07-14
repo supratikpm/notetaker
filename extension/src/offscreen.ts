@@ -65,6 +65,8 @@ chrome.runtime.onMessage.addListener((msg: ExtMessage, _sender, sendResponse) =>
         .then(() => sendResponse({ ok: true }))
         .catch((e) => {
           console.error("[Notetaker offscreen] startRecording failed:", e);
+          isRecording = false;
+          releaseDevices(); // don't leak the mic/tab capture on a partial start
           // Notify background so it can clean up pending state
           chrome.runtime.sendMessage({
             type: "RECORDING_FAILED",

@@ -62,18 +62,22 @@ async function onMeetingStarted(tabId: number, url: string): Promise<void> {
   }
 }
 
-async function beginRecordingForTab(tabId: number): Promise<void> {
+async function beginRecordingForTab(tabId: number): Promise<boolean> {
   const session = activeSessions.get(tabId);
-  if (!session || session.recordingActive) return; // not armed, or already recording
+  if (!session) return false;
+  if (session.recordingActive) return true; // already recording
 
   session.startTime = Date.now(); // meeting clock starts at actual join
   await ensureOffscreenDocument();
-  await startTabCapture(tabId);
+  const ok = await startTabCapture(tabId);
 
-  chrome.notifications.create(`start_${tabId}`, {
-    type: "basic", iconUrl: "icons/icon48.png",
-    title: "Notetaker is recording", message: `Recording: ${session.meetingTitle}`,
-  });
+  if (ok) {
+    chrome.notifications.create(`start_${tabId}`, {
+      type: "basic", iconUrl: "icons/icon48.png",
+      title: "Notetaker is recording", message: `Recording: ${session.meetingTitle}`,
+    });
+  }
+  return ok;
 }
 
 // Recording is never auto-started (Chrome requires a user gesture for tab
@@ -119,15 +123,16 @@ function getMediaStreamIdOnce(tabId: number): Promise<string> {
   });
 }
 
-async function startTabCapture(tabId: number): Promise<void> {
+async function startTabCapture(tabId: number): Promise<boolean> {
   const session = activeSessions.get(tabId);
-  if (!session) return;
+  if (!session) return false;
 
   const settings = await chrome.storage.sync.get(["backendUrl"]);
   const backendUrl = (settings.backendUrl as string) || "http://localhost:8000";
 
   // getMediaStreamId can transiently fail on a second capture in the same
-  // profile (the previous capture may not be fully torn down yet). Retry.
+  // profile (previous capture not fully torn down). Retry those — but NOT the
+  // activeTab/"not invoked" error, which is permanent until the user gestures.
   let streamId: string | null = null;
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= 4; attempt++) {
@@ -136,28 +141,29 @@ async function startTabCapture(tabId: number): Promise<void> {
       break;
     } catch (e) {
       lastErr = e;
+      const em = String(e);
+      if (em.includes("activeTab") || em.includes("has not been invoked")) break;
       console.warn(`[Notetaker] getMediaStreamId attempt ${attempt} failed:`, e);
-      await new Promise((r) => setTimeout(r, 400 * attempt));
+      if (attempt < 4) await new Promise((r) => setTimeout(r, 400 * attempt));
     }
   }
 
   if (!streamId) {
     const msg = String(lastErr ?? "");
     const needsGesture = msg.includes("activeTab") || msg.includes("has not been invoked");
-    console.error("[Notetaker] Tab capture failed after retries:", lastErr);
+    console.error("[Notetaker] Tab capture failed:", lastErr);
     // Chrome requires a user gesture (activeTab) before a tab can be captured.
-    // Prompt the user to click the toolbar icon, which opens the popup and
-    // grants activeTab — the popup then triggers ENSURE_RECORDING.
+    // Prompt the user to click the toolbar icon → Start Recording.
     try { chrome.action.setBadgeBackgroundColor({ color: "#f59e0b" }); } catch (_) {}
     try { chrome.action.setBadgeText({ tabId, text: "▶" }); } catch (_) {}
     chrome.notifications.create(`capfail_${tabId}`, {
       type: "basic", iconUrl: "icons/icon48.png",
-      title: "Notetaker — click to start recording",
+      title: "Notetaker — couldn't start recording",
       message: needsGesture
-        ? "Click the Notetaker toolbar icon on this meeting tab to start recording."
-        : "Couldn't capture this tab. Click the Notetaker icon to retry.",
+        ? "Open the Notetaker popup from the meeting tab, then click Start Recording."
+        : "Couldn't capture this tab. Click Start Recording again to retry.",
     });
-    return;
+    return false;
   }
 
   chrome.runtime.sendMessage({
@@ -175,6 +181,7 @@ async function startTabCapture(tabId: number): Promise<void> {
   try { chrome.action.setBadgeBackgroundColor({ color: "#ef4444" }); } catch (_) {}
   try { chrome.action.setBadgeText({ tabId, text: "●" }); } catch (_) {}
   console.log("[Notetaker] START_RECORDING sent for tab", tabId, "session", session.sessionId);
+  return true;
 }
 
 async function onMeetingEnded(tabId: number): Promise<void> {
@@ -526,13 +533,16 @@ chrome.runtime.onMessage.addListener((msg: ExtMessage, _sender, sendResponse) =>
 
   if (msg.type === "RECORDING_FAILED") {
     const { tabId } = msg.payload as { tabId: number };
-    console.warn("[Notetaker] Audio capture failed for tab", tabId, "— will use captions only when meeting ends.");
-    // Just flag the session — do NOT call processCompletedMeeting yet.
-    // pending_${tabId} doesn't exist until onMeetingEnded runs.
-    // When the meeting ends, STOP_RECORDING will be sent, offscreen will reply with
-    // RECORDING_COMPLETE (audioData: null), and processing will continue with captions.
+    console.warn("[Notetaker] Recording failed for tab", tabId);
+    // Recording is no longer active — clear the flag (memory + storage) and the
+    // badge so state stays consistent and leave/close won't try to finalize it.
     const session = activeSessions.get(tabId);
     if (session) session.recordingActive = false;
+    chrome.storage.session.get([`session_${tabId}`]).then((st) => {
+      const sd = st[`session_${tabId}`] as Record<string, unknown> | undefined;
+      if (sd) chrome.storage.session.set({ [`session_${tabId}`]: { ...sd, recordingActive: false } });
+    });
+    try { chrome.action.setBadgeText({ tabId, text: "" }); } catch (_) {}
     sendResponse({ ok: true });
   }
 

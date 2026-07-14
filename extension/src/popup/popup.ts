@@ -36,7 +36,9 @@ async function init() {
     // it is the user gesture Chrome needs to allow tab capture.
     btnRecord.style.display = "flex";
 
-    if (session) {
+    // A session object exists as soon as the meeting is armed; recording is only
+    // actually running when recordingActive is true.
+    if (session?.recordingActive) {
       meetingStartTime = session.startTime;
       setStatus("recording", `Recording: ${session.meetingTitle || "Google Meet"}`);
       setRecordButton(true);
@@ -137,27 +139,37 @@ async function loadScreenshots(tabId: number) {
 // ── Listeners ──────────────────────────────────────────────────────────────
 
 btnRecord.addEventListener("click", async () => {
-  // Prefer the currently-active tab (that's the one activeTab is granted for).
+  // Tab capture needs activeTab, which is granted for the tab that was active
+  // when the popup opened. That must be the meeting tab.
   const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  const targetId =
-    activeTab?.id != null && (activeTab.url ?? "").includes("meet.google.com")
-      ? activeTab.id
-      : activeMeetTabId;
-  if (targetId == null) return;
+  const onMeetTab = activeTab?.id != null && (activeTab.url ?? "").includes("meet.google.com");
+  if (!onMeetTab) {
+    setStatus("idle", "Switch to the meeting tab, then click Start Recording.");
+    return;
+  }
+  const targetId = activeTab!.id!;
+  activeMeetTabId = targetId;
+  activeMeetWindowId = activeTab!.windowId ?? activeMeetWindowId;
 
   btnRecord.textContent = "Starting…";
   btnRecord.disabled = true;
   chrome.runtime.sendMessage({ type: "ENSURE_RECORDING", payload: { tabId: targetId } } as ExtMessage);
-  activeMeetTabId = targetId;
 
-  // Reflect recording state shortly after (capture starts async in background).
-  setTimeout(() => {
-    setRecordButton(true);
-    setStatus("recording", "Recording…");
-    btnScreenshot.disabled = false;
-    btnProcess.style.display = "flex";
-    if (!meetingStartTime) { meetingStartTime = Date.now(); startTimer(); }
-  }, 800);
+  // Confirm the real outcome from persisted state instead of assuming success.
+  setTimeout(async () => {
+    const stored = await chrome.storage.session.get([`session_${targetId}`]);
+    const rec = (stored[`session_${targetId}`] as { recordingActive?: boolean } | undefined)?.recordingActive === true;
+    if (rec) {
+      setRecordButton(true);
+      setStatus("recording", "Recording…");
+      btnScreenshot.disabled = false;
+      btnProcess.style.display = "flex";
+      if (!meetingStartTime) { meetingStartTime = Date.now(); startTimer(); }
+    } else {
+      setRecordButton(false);
+      setStatus("idle", "Couldn't start — try again.");
+    }
+  }, 1500);
 });
 
 btnScreenshot.addEventListener("click", takeScreenshot);

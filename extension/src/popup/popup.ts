@@ -3,6 +3,7 @@ import type { ExtMessage } from "../utils/messaging";
 const statusDot = document.getElementById("status-dot") as HTMLDivElement;
 const statusText = document.getElementById("status-text") as HTMLSpanElement;
 const meetingTimeEl = document.getElementById("meeting-time") as HTMLDivElement;
+const btnRecord = document.getElementById("btn-record") as HTMLButtonElement;
 const btnScreenshot = document.getElementById("btn-screenshot") as HTMLButtonElement;
 const btnSettings = document.getElementById("btn-settings") as HTMLButtonElement;
 const btnProcess = document.getElementById("btn-process") as HTMLButtonElement;
@@ -22,37 +23,45 @@ async function init() {
   const settings = await chrome.storage.sync.get(["autoMode"]);
   toggleAuto.checked = settings.autoMode !== false;
 
-  // Opening the popup is the user gesture that grants activeTab, which tab
-  // capture requires. If the currently-active tab is a Meet call, tell the
-  // background to ensure recording is running (it's a no-op if already active).
-  if (toggleAuto.checked) {
-    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (activeTab?.id != null && (activeTab.url ?? "").includes("meet.google.com")) {
-      chrome.runtime.sendMessage({
-        type: "ENSURE_RECORDING",
-        payload: { tabId: activeTab.id },
-      } as ExtMessage);
-    }
-  }
-
   const tabs = await chrome.tabs.query({ url: "https://meet.google.com/*" });
   if (tabs.length > 0 && tabs[0].id != null) {
     const tabId = tabs[0].id;
+    activeMeetTabId = tabId;
+    activeMeetWindowId = tabs[0].windowId ?? null;
+
     const stored = await chrome.storage.session.get([`session_${tabId}`]);
-    const session = stored[`session_${tabId}`] as { startTime: number; meetingTitle: string } | undefined;
+    const session = stored[`session_${tabId}`] as { startTime: number; meetingTitle: string; recordingActive?: boolean } | undefined;
+
+    // Always offer a manual Record button while a meeting tab is open — clicking
+    // it is the user gesture Chrome needs to allow tab capture.
+    btnRecord.style.display = "flex";
 
     if (session) {
-      activeMeetTabId = tabId;
-      activeMeetWindowId = tabs[0].windowId ?? null;
       meetingStartTime = session.startTime;
       setStatus("recording", `Recording: ${session.meetingTitle || "Google Meet"}`);
+      setRecordButton(true);
       btnScreenshot.disabled = false;
       btnProcess.style.display = "flex";
       loadScreenshots(tabId);
       startTimer();
     } else {
-      setStatus("idle", "In a meeting — auto-join is off");
+      setStatus("idle", "In a meeting — click Start Recording");
+      setRecordButton(false);
     }
+  } else {
+    btnRecord.style.display = "none";
+  }
+}
+
+function setRecordButton(recording: boolean) {
+  if (recording) {
+    btnRecord.textContent = "● Recording";
+    btnRecord.style.background = "#3f3f46";
+    btnRecord.disabled = true;
+  } else {
+    btnRecord.textContent = "⏺ Start Recording";
+    btnRecord.style.background = "#ef4444";
+    btnRecord.disabled = false;
   }
 }
 
@@ -126,6 +135,30 @@ async function loadScreenshots(tabId: number) {
 }
 
 // ── Listeners ──────────────────────────────────────────────────────────────
+
+btnRecord.addEventListener("click", async () => {
+  // Prefer the currently-active tab (that's the one activeTab is granted for).
+  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const targetId =
+    activeTab?.id != null && (activeTab.url ?? "").includes("meet.google.com")
+      ? activeTab.id
+      : activeMeetTabId;
+  if (targetId == null) return;
+
+  btnRecord.textContent = "Starting…";
+  btnRecord.disabled = true;
+  chrome.runtime.sendMessage({ type: "ENSURE_RECORDING", payload: { tabId: targetId } } as ExtMessage);
+  activeMeetTabId = targetId;
+
+  // Reflect recording state shortly after (capture starts async in background).
+  setTimeout(() => {
+    setRecordButton(true);
+    setStatus("recording", "Recording…");
+    btnScreenshot.disabled = false;
+    btnProcess.style.display = "flex";
+    if (!meetingStartTime) { meetingStartTime = Date.now(); startTimer(); }
+  }, 800);
+});
 
 btnScreenshot.addEventListener("click", takeScreenshot);
 btnSettings.addEventListener("click", () => chrome.runtime.openOptionsPage());

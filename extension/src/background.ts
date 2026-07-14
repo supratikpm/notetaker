@@ -54,16 +54,26 @@ async function onMeetingStarted(tabId: number, url: string): Promise<void> {
       } as ExtMessage);
     } catch (_) { /* content script may not be injected yet */ }
 
-    await ensureOffscreenDocument();
-    await startTabCapture(tabId);
-
-    chrome.notifications.create(`start_${tabId}`, {
-      type: "basic", iconUrl: "icons/icon48.png",
-      title: "Notetaker is recording", message: `Recording: ${meetingTitle}`,
-    });
+    // NOTE: recording does NOT start here — the tab may still be on the pre-join
+    // lobby. The content script fires MEETING_JOINED once actually in the call,
+    // which triggers startTabCapture (see message handler below).
   } finally {
     pendingTransitions.delete(tabId);
   }
+}
+
+async function beginRecordingForTab(tabId: number): Promise<void> {
+  const session = activeSessions.get(tabId);
+  if (!session || session.recordingActive) return; // not armed, or already recording
+
+  session.startTime = Date.now(); // meeting clock starts at actual join
+  await ensureOffscreenDocument();
+  await startTabCapture(tabId);
+
+  chrome.notifications.create(`start_${tabId}`, {
+    type: "basic", iconUrl: "icons/icon48.png",
+    title: "Notetaker is recording", message: `Recording: ${session.meetingTitle}`,
+  });
 }
 
 async function startTabCapture(tabId: number): Promise<void> {
@@ -188,6 +198,30 @@ async function processCompletedMeeting(
 
   const activeSessionId = sessionId || pending.session?.sessionId;
 
+  // Persist the recording (audio + video) out of temp storage FIRST — before any
+  // transcription — so the .webm files are always saved even if transcription
+  // hangs or crashes. This also frees the temp file so the transcribe call below
+  // returns immediately instead of blocking on Whisper.
+  let recordingFiles: { audio?: string; video?: string } = {};
+  if (activeSessionId) {
+    try {
+      const res = await fetch(
+        `${backendUrl}/api/transcribe/recording/finalize?session_id=${encodeURIComponent(activeSessionId)}` +
+          `&basename=${encodeURIComponent(pending.session.meetingTitle || "meeting")}`,
+        { method: "POST", signal: AbortSignal.timeout(30_000) }
+      );
+      if (res.ok) {
+        const data = await res.json() as { files?: { audio?: string; video?: string } };
+        recordingFiles = data.files ?? {};
+        console.log("[Notetaker] Recording saved:", recordingFiles);
+      } else {
+        console.warn("[Notetaker] Recording finalize returned HTTP", res.status);
+      }
+    } catch (e) {
+      console.error("[Notetaker] Recording finalize failed:", e);
+    }
+  }
+
   // Fall back to Whisper if no captions captured
   if (segments.length === 0 && (audioBlob || activeSessionId)) {
     transcriptSource = "whisper";
@@ -221,27 +255,6 @@ async function processCompletedMeeting(
       }
     } catch (e) {
       console.error("[Notetaker] Transcription failed:", e);
-    }
-  }
-
-  // Persist the recording (audio + video) out of temp storage. Runs regardless
-  // of whether captions or Whisper produced the transcript.
-  let recordingFiles: { audio?: string; video?: string } = {};
-  if (activeSessionId) {
-    try {
-      const res = await fetch(
-        `${backendUrl}/api/transcribe/recording/finalize?session_id=${encodeURIComponent(activeSessionId)}` +
-          `&basename=${encodeURIComponent(pending.session.meetingTitle || "meeting")}`,
-        { method: "POST", signal: AbortSignal.timeout(30_000) }
-      );
-      if (res.ok) {
-        const data = await res.json() as { files?: { audio?: string; video?: string } };
-        recordingFiles = data.files ?? {};
-      } else {
-        console.warn("[Notetaker] Recording finalize returned HTTP", res.status);
-      }
-    } catch (e) {
-      console.error("[Notetaker] Recording finalize failed:", e);
     }
   }
 
@@ -382,12 +395,23 @@ chrome.runtime.onMessage.addListener((msg: ExtMessage, _sender, sendResponse) =>
     sendResponse({ ok: true });
   }
 
-  if (msg.type === "MEETING_ENDED_EARLY") {
-    // Content script detected meeting end from DOM before tab navigated away
-    // Find the tab this message came from
+  if (msg.type === "MEETING_JOINED") {
+    // Content script detected the user is actually in the call — start recording.
     const senderTabId = _sender.tab?.id;
-    if (senderTabId && activeSessions.has(senderTabId)) {
-      console.log("[Notetaker] Early meeting-end signal from tab", senderTabId);
+    if (senderTabId != null && activeSessions.has(senderTabId)) {
+      console.log("[Notetaker] Join signal from tab", senderTabId, "— starting recording.");
+      beginRecordingForTab(senderTabId).catch((e) =>
+        console.warn("[Notetaker] beginRecordingForTab failed:", e)
+      );
+    }
+    sendResponse({ ok: true });
+  }
+
+  if (msg.type === "MEETING_LEFT" || msg.type === "MEETING_ENDED_EARLY") {
+    // Content script detected the user left the call — stop and process.
+    const senderTabId = _sender.tab?.id;
+    if (senderTabId != null && activeSessions.has(senderTabId)) {
+      console.log("[Notetaker] Leave signal from tab", senderTabId, "— ending meeting.");
       onMeetingEnded(senderTabId);
     }
     sendResponse({ ok: true });

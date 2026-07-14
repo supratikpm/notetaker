@@ -260,46 +260,77 @@ function startObserving(): void {
   tryAttach();
 }
 
-// ── Detect meeting end from DOM (before tab navigates away) ────────────────
-function watchForMeetingEnd(): void {
-  const leaveCheckInterval = setInterval(() => {
-    // Google Meet shows "You left the call" or similar text when user has left
-    const bodyText = document.body?.innerText ?? "";
-    const leftCall =
-      bodyText.includes("You left the call") ||
-      bodyText.includes("left the call") ||
-      bodyText.includes("Return to home screen") ||
-      bodyText.includes("Rejoin");
+// ── Detect actual join / leave via the in-call "Leave call" control ──────────
+// Recording must track the REAL call, not the pre-join lobby. The hang-up /
+// "Leave call" button only exists while you are actually in the call, so its
+// presence is the most reliable in-call signal across Meet DOM versions.
+let inCall = false;
+let absenceStreak = 0;
+let callWatchStarted = false;
+const LEAVE_DEBOUNCE = 3; // consecutive absent polls (~4.5s) before declaring "left"
 
-    // Also check if the call controls are gone (means we're no longer in a call)
-    const callControls = document.querySelector("[data-call-ended], .uGOf1d, [jsname='BOHacd']");
+function findLeaveButton(): Element | null {
+  return (
+    document.querySelector('button[aria-label="Leave call" i]') ||
+    document.querySelector('[aria-label="Leave call" i]') ||
+    document.querySelector('button[aria-label*="leave call" i]') ||
+    document.querySelector('button[aria-label*="leave the call" i]') ||
+    document.querySelector('[data-tooltip*="Leave call" i]') ||
+    document.querySelector('[jsname="CQylad"]') // legacy hang-up jsname (best-effort)
+  );
+}
 
-    if (leftCall || callControls) {
-      clearInterval(leaveCheckInterval);
-      console.log("[Notetaker] Detected meeting end from DOM — pushing transcript to storage.");
-      if (observer) { observer.disconnect(); observer = null; }
-      persistTranscript();
-      // Notify background that we've left so it can start processing
-      chrome.runtime.sendMessage({ type: "MEETING_ENDED_EARLY" } as ExtMessage).catch(() => {});
+function watchCallState(): void {
+  if (callWatchStarted) return;
+  callWatchStarted = true;
+
+  const interval = setInterval(() => {
+    const present = !!findLeaveButton();
+
+    if (present) {
+      absenceStreak = 0;
+      if (!inCall) {
+        // false → true: user just joined the actual call.
+        inCall = true;
+        meetingStartTime = Date.now();
+        segments = [];
+        recentlySeen.clear();
+        console.log("[Notetaker] Joined call — start recording.");
+        startObserving(); // begin caption capture now that we're in-call
+        chrome.runtime.sendMessage({ type: "MEETING_JOINED" } as ExtMessage).catch(() => {});
+      }
+    } else if (inCall) {
+      // Controls can auto-hide briefly — require a few consecutive misses.
+      absenceStreak++;
+      if (absenceStreak >= LEAVE_DEBOUNCE) {
+        // true → false: user left the call.
+        inCall = false;
+        absenceStreak = 0;
+        console.log("[Notetaker] Left call — stop recording.");
+        if (observer) { observer.disconnect(); observer = null; }
+        persistTranscript();
+        chrome.runtime.sendMessage({ type: "MEETING_LEFT" } as ExtMessage).catch(() => {});
+      }
     }
-  }, 2000);
+  }, 1500);
 
-  // Stop checking after 4 hours
-  setTimeout(() => clearInterval(leaveCheckInterval), 4 * 60 * 60 * 1000);
+  // Stop checking after 4 hours (safety).
+  setTimeout(() => clearInterval(interval), 4 * 60 * 60 * 1000);
 }
 
 // ── Message handling ───────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg: ExtMessage, _sender, sendResponse) => {
   switch (msg.type) {
     case "MEETING_STARTED": {
+      // Tab loaded a Meet URL (may still be the lobby). Don't record yet —
+      // watchCallState() will fire MEETING_JOINED once actually in the call.
       const payload = msg.payload as { tabId?: number; meetingId?: string };
       if (payload?.tabId) _cachedTabId = payload.tabId;
       segments = [];
       recentlySeen.clear();
       meetingStartTime = Date.now();
       attachRetryCount = 0;
-      startObserving();
-      watchForMeetingEnd();
+      watchCallState();
       sendResponse({ ok: true });
       break;
     }
@@ -318,9 +349,9 @@ chrome.runtime.onMessage.addListener((msg: ExtMessage, _sender, sendResponse) =>
   return true;
 });
 
-// Auto-start when injected into an active Meet URL
-startObserving();
-watchForMeetingEnd();
+// Auto-start when injected into an active Meet URL. Only watch for the join
+// transition here — caption observing + recording begin once actually in-call.
+watchCallState();
 
 // ── One-time DOM probe (runs 15s after page load to find caption container) ──
 setTimeout(() => {

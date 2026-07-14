@@ -109,11 +109,20 @@ async function startTabCapture(tabId: number): Promise<void> {
   }
 
   if (!streamId) {
+    const msg = String(lastErr ?? "");
+    const needsGesture = msg.includes("activeTab") || msg.includes("has not been invoked");
     console.error("[Notetaker] Tab capture failed after retries:", lastErr);
+    // Chrome requires a user gesture (activeTab) before a tab can be captured.
+    // Prompt the user to click the toolbar icon, which opens the popup and
+    // grants activeTab — the popup then triggers ENSURE_RECORDING.
+    try { chrome.action.setBadgeBackgroundColor({ color: "#f59e0b" }); } catch (_) {}
+    try { chrome.action.setBadgeText({ tabId, text: "▶" }); } catch (_) {}
     chrome.notifications.create(`capfail_${tabId}`, {
       type: "basic", iconUrl: "icons/icon48.png",
-      title: "Notetaker — recording didn't start",
-      message: "Couldn't capture this tab. Click the Notetaker icon on the meeting tab, then rejoin.",
+      title: "Notetaker — click to start recording",
+      message: needsGesture
+        ? "Click the Notetaker toolbar icon on this meeting tab to start recording."
+        : "Couldn't capture this tab. Click the Notetaker icon to retry.",
     });
     return;
   }
@@ -124,6 +133,8 @@ async function startTabCapture(tabId: number): Promise<void> {
   } as ExtMessage);
 
   session.recordingActive = true;
+  try { chrome.action.setBadgeBackgroundColor({ color: "#ef4444" }); } catch (_) {}
+  try { chrome.action.setBadgeText({ tabId, text: "●" }); } catch (_) {}
   console.log("[Notetaker] START_RECORDING sent for tab", tabId, "session", session.sessionId);
 }
 
@@ -134,6 +145,7 @@ async function onMeetingEnded(tabId: number): Promise<void> {
   try {
     const session = activeSessions.get(tabId)!;
     activeSessions.delete(tabId);
+    try { chrome.action.setBadgeText({ tabId, text: "" }); } catch (_) {}
 
     // Collect captions FIRST, then stop audio — preserves ordering
     let captionSegments: unknown[] = [];
@@ -438,6 +450,26 @@ chrome.runtime.onMessage.addListener((msg: ExtMessage, _sender, sendResponse) =>
         }
       })().catch((e) => console.warn("[Notetaker] join handling failed:", e));
     }
+    sendResponse({ ok: true });
+  }
+
+  if (msg.type === "ENSURE_RECORDING") {
+    // Sent by the popup when it opens — opening the popup grants the activeTab
+    // gesture that tab capture requires. Start recording if a meeting is active
+    // on this tab and it isn't already recording.
+    const { tabId } = msg.payload as { tabId: number };
+    (async () => {
+      if (!activeSessions.has(tabId)) {
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        if (tab && isMeetUrl(tab.url ?? "")) {
+          await onMeetingStarted(tabId, tab.url ?? "");
+        }
+      }
+      if (activeSessions.has(tabId)) {
+        console.log("[Notetaker] ENSURE_RECORDING for tab", tabId);
+        await beginRecordingForTab(tabId);
+      }
+    })().catch((e) => console.warn("[Notetaker] ensure-recording failed:", e));
     sendResponse({ ok: true });
   }
 

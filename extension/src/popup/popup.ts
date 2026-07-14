@@ -22,6 +22,19 @@ async function init() {
   const settings = await chrome.storage.sync.get(["autoMode"]);
   toggleAuto.checked = settings.autoMode !== false;
 
+  // Opening the popup is the user gesture that grants activeTab, which tab
+  // capture requires. If the currently-active tab is a Meet call, tell the
+  // background to ensure recording is running (it's a no-op if already active).
+  if (toggleAuto.checked) {
+    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (activeTab?.id != null && (activeTab.url ?? "").includes("meet.google.com")) {
+      chrome.runtime.sendMessage({
+        type: "ENSURE_RECORDING",
+        payload: { tabId: activeTab.id },
+      } as ExtMessage);
+    }
+  }
+
   const tabs = await chrome.tabs.query({ url: "https://meet.google.com/*" });
   if (tabs.length > 0 && tabs[0].id != null) {
     const tabId = tabs[0].id;

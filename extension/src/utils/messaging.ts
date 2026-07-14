@@ -2,6 +2,7 @@ export type MessageType =
   | "MEETING_STARTED"
   | "MEETING_JOINED"
   | "MEETING_LEFT"
+  | "ENSURE_RECORDING"
   | "MEETING_ENDED"
   | "START_RECORDING"
   | "STOP_RECORDING"

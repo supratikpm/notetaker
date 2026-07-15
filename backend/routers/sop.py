@@ -63,6 +63,34 @@ async def create_sop(req: SopRequest):
     return SopResponse(sop_markdown=sop_markdown, sop_html=sop_html)
 
 
+@router.post("/save-session", response_model=SaveSessionResponse)
+async def save_session_endpoint(req: SaveSessionRequest):
+    """Persist a meeting session directly, independent of SOP generation.
+
+    The extension should call this at meeting-end so a completed meeting is
+    never lost if SOP generation later fails or is skipped.
+    """
+    if not req.segments:
+        raise HTTPException(status_code=400, detail="Transcript segments are required.")
+
+    try:
+        saved_path = save_session(
+            meeting_title=req.meeting_title or "Untitled Meeting",
+            meeting_date=req.meeting_date or "",
+            segments=req.segments,
+            sop_markdown=req.sop_markdown or "",
+            screenshots=req.screenshots,
+            host_name=req.host_name,
+            recording_audio=req.recording_audio,
+            recording_video=req.recording_video,
+        )
+    except Exception as e:
+        logger.error("Failed to save session: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to save session: {e}")
+
+    return SaveSessionResponse(success=True, filename=saved_path.name)
+
+
 @router.get("/sessions")
 async def get_sessions():
     """List all saved meeting sessions."""
